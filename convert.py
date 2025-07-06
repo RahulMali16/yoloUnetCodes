@@ -1,5 +1,5 @@
 import torch
-from UNet import UNet  # ✅ Make sure UNet.py is in the same folder
+from unet import UNet  # ✅ Make sure UNet.py is in the same folder
 
 # 🧠 Instantiate your model
 model = UNet(in_channels=3, out_channels=1, init_features=32)
