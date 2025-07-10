@@ -1,0 +1,219 @@
+import React, { useEffect, useState } from "react";
+import * as nifti from "nifti-reader-js";
+import * as ort from "onnxruntime-web";
+
+const YOLO_CLASSES = ["eye1", "eye2"];
+
+const App = () => {
+  const [session, setSession] = useState(null);
+  const [canvases, setCanvases] = useState([]);
+
+  useEffect(() => {
+    const loadModel = async () => {
+      const yolov8Session = await ort.InferenceSession.create("yolov8m.onnx");
+      setSession(yolov8Session);
+    };
+    loadModel();
+  }, []);
+
+  const handleFileUpload = async (event) => {
+    const file = event.target.files[0];
+    if (!file || !session) return;
+
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const arrayBuffer = reader.result;
+      if (!nifti.isCompressed(arrayBuffer) && nifti.isNIFTI(arrayBuffer)) {
+        const header = nifti.readHeader(arrayBuffer);
+        const imageData = nifti.readImage(header, arrayBuffer);
+
+        let volume;
+        switch (header.datatypeCode) {
+          case nifti.NIFTI1.TYPE_UINT16:
+            volume = new Uint16Array(imageData);
+            break;
+          case nifti.NIFTI1.TYPE_UINT8:
+            volume = new Uint8Array(imageData);
+            break;
+          case nifti.NIFTI1.TYPE_INT16:
+            volume = new Int16Array(imageData);
+            break;
+          case nifti.NIFTI1.TYPE_INT32:
+            volume = new Int32Array(imageData);
+            break;
+          case nifti.NIFTI1.TYPE_FLOAT32:
+            volume = new Float32Array(imageData);
+            break;
+          default:
+            alert("Unsupported datatype");
+            return;
+        }
+
+        const width = header.dims[1];
+        const height = header.dims[2];
+        const depth = header.dims[3];
+        const canvasesArray = [];
+
+        for (let z = 0; z < depth; z++) {
+          // Prepare canvas
+          const canvas = document.createElement("canvas");
+          canvas.width = 512;
+          canvas.height = 512;
+          const ctx = canvas.getContext("2d");
+
+          // Normalize
+          const sliceOffset = z * width * height;
+          const imgData = ctx.createImageData(width, height);
+          let min = Infinity, max = -Infinity;
+          for (let i = 0; i < width * height; i++) {
+            const val = volume[sliceOffset + i];
+            if (val < min) min = val;
+            if (val > max) max = val;
+          }
+
+          for (let i = 0; i < width * height; i++) {
+            const norm = (volume[sliceOffset + i] - min) / (max - min || 1);
+            const pixel = Math.floor(norm * 255);
+            imgData.data[i * 4 + 0] = pixel;
+            imgData.data[i * 4 + 1] = pixel;
+            imgData.data[i * 4 + 2] = pixel;
+            imgData.data[i * 4 + 3] = 255;
+          }
+
+          ctx.putImageData(imgData, 0, 0);
+
+          // Resize
+          const resizedCanvas = document.createElement("canvas");
+          resizedCanvas.width = 512;
+          resizedCanvas.height = 512;
+          const rctx = resizedCanvas.getContext("2d");
+          rctx.drawImage(canvas, 0, 0, 512, 512);
+
+          const imageData = rctx.getImageData(0, 0, 512, 512).data;
+          const red = [], green = [], blue = [];
+          for (let i = 0; i < imageData.length; i += 4) {
+            red.push(imageData[i] / 255);
+            green.push(imageData[i + 1] / 255);
+            blue.push(imageData[i + 2] / 255);
+          }
+          const input = new Float32Array([...red, ...green, ...blue]);
+          const tensor = new ort.Tensor("float32", input, [1, 3, 512, 512]);
+
+          const output = await session.run({ images: tensor });
+          const boxes = processOutput(output.output0.data, 512, 512);
+
+          // Draw on final canvas
+          const finalCanvas = document.createElement("canvas");
+          finalCanvas.width = 512;
+          finalCanvas.height = 512;
+          const finalCtx = finalCanvas.getContext("2d");
+
+          finalCtx.drawImage(rctx.canvas, 0, 0);
+          finalCtx.font = "14px Arial";
+          finalCtx.lineWidth = 2;
+
+          boxes.forEach(([x1, y1, x2, y2, label, prob]) => {
+            finalCtx.strokeStyle = "#00FF00";
+            finalCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+            const text = `${label} (${(prob * 100).toFixed(1)}%)`;
+            finalCtx.fillStyle = "#00FF00";
+            finalCtx.fillRect(x1, y1 - 20, finalCtx.measureText(text).width + 10, 20);
+            finalCtx.fillStyle = "#000000";
+            finalCtx.fillText(text, x1 + 5, y1 - 5);
+          });
+
+          canvasesArray.push(finalCanvas);
+        }
+
+        setCanvases(canvasesArray);
+      }
+    };
+
+    reader.readAsArrayBuffer(file);
+  };
+
+  const processOutput = (output, imgWidth, imgHeight) => {
+    const num_classes = YOLO_CLASSES.length;
+    const values_per_prediction = 4 + num_classes;
+    const num_boxes = output.length / values_per_prediction;
+
+    let boxes = [];
+
+    for (let i = 0; i < num_boxes; i++) {
+      const [classId, prob] = [...Array(num_classes).keys()]
+        .map(j => [j, output[num_boxes * (j + 4) + i]])
+        .reduce((a, b) => (b[1] > a[1] ? b : a), [0, 0]);
+
+      if (prob < 0.5) continue;
+
+      const xc = output[i];
+      const yc = output[num_boxes + i];
+      const w = output[2 * num_boxes + i];
+      const h = output[3 * num_boxes + i];
+
+      const x1 = (xc - w / 2) / 512 * imgWidth;
+      const y1 = (yc - h / 2) / 512 * imgHeight;
+      const x2 = (xc + w / 2) / 512 * imgWidth;
+      const y2 = (yc + h / 2) / 512 * imgHeight;
+
+      const label = YOLO_CLASSES[classId];
+      boxes.push([x1, y1, x2, y2, label, prob]);
+    }
+
+    boxes.sort((a, b) => b[5] - a[5]);
+    const result = [];
+    while (boxes.length > 0) {
+      const selected = boxes.shift();
+      result.push(selected);
+      boxes = boxes.filter((box) => iou(selected, box) < 0.7);
+    }
+
+    return result;
+  };
+
+  const iou = (a, b) => {
+    const inter = intersection(a, b);
+    const union = area(a) + area(b) - inter;
+    return inter / union;
+  };
+
+  const intersection = (a, b) => {
+    const [x1, y1, x2, y2] = [
+      Math.max(a[0], b[0]),
+      Math.max(a[1], b[1]),
+      Math.min(a[2], b[2]),
+      Math.min(a[3], b[3])
+    ];
+    return Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  };
+
+  const area = ([x1, y1, x2, y2]) => Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+
+  return (
+    <div style={{ textAlign: "center" }}>
+      <h2> Detection on All .nii Slices</h2>
+      <input type="file" accept=".nii" onChange={handleFileUpload} />
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fill, minmax(256px, 1fr))",
+          gap: "10px",
+          marginTop: "20px",
+        }}
+      >
+        {canvases.map((canvas, index) => (
+          <div key={index}>
+            <div>Slice {index}</div>
+            <div
+              dangerouslySetInnerHTML={{
+                __html: canvas.outerHTML,
+              }}
+            />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+export default App;
